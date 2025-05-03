@@ -1,0 +1,22 @@
+Mental Health Support Chatbot Application
+
+dataa/ contains .pdf files for vector embeddings creation.
+faiss_database contains faiss index file.
+requirements.txt contains all dependencies required for this project.
+vectorstore_creation.ipnyb contains code to create vector store using huggingface transformer models
+
+
+1.hugging face transformers -> convert the pdf text into vector embeddings to compare meanings
+
+hugging face pretrained model called sentence-transformers
+
+2.FAISS(Facebook AI similarity search)
+
+stores the embeddings and allows quick similarity search
+
+3.Mistral LLM model 
+
+###Flow:
+user asks question-> convert query to embedding-> use FAISS to find most similar document chunks -> send those chunks and user's question document to LLM(Mistral) for answering
+
+After getting question, and question is converted to embedding, FAISS used to find relevant document, then mistral generates answer based on that question
