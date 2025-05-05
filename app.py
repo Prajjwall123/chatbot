@@ -5,110 +5,134 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
-from dotenv import load_dotenv
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
-from langchain_core.callbacks import CallbackManager
 from langchain_core.language_models import LLM
 from langchain_core.outputs import LLMResult, Generation
 from typing import Optional, List
-from transformers import Pipeline
 
 print("CUDA Available:", torch.cuda.is_available())
 print("Device:", "GPU" if torch.cuda.is_available() else "CPU")
 
-load_dotenv()
-
 app = Flask(__name__)
 CORS(app)
 
+# Paths and model name
 DB_FAISS_PATH = "faiss_database"
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
-# Prompt template
 CUSTOM_PROMPT_TEMPLATE = """
-You're a mental health chatbot assistant. Help people with their mental health issues.
-Use the following pieces of context to answer the user's question.
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
-
-Context: {context}
-Question: {question}
-
-Start the answer directly.
+<|im_start|>system
+You are a helpful and supportive mental health assistant. Your primary goal is to provide empathetic, non-judgmental, and safe support. Always:
+- If the user greets you with 'hi', 'hello', or similar phrases, respond exactly with 'Hi, how are you feeling today?' and nothing else.
+- Validate the user's feelings (e.g., 'I'm sorry you're feeling this way').
+- If the user mentions anxiety, validate their feelings and provide a full list of safe, simple techniques:
+  1. Listen: 'I understand you might be feeling anxious or overwhelmed, and that’s okay. I’ll be here to listen without judgment.'
+  2. Suggest breathing: 'Try taking slow, deep breaths—inhale for 4 seconds, hold for 4, and exhale for 4.'
+  3. Suggest grounding: 'Focus on your senses: name 5 things you can see, 4 you can touch, 3 you can hear, 2 you can smell, and 1 you can taste.'
+  4. Encourage professional help: 'If you feel you need more support, consider reaching out to a professional, like a therapist or counselor.'
+- Avoid giving advice that could be harmful or misinterpreted, especially on sensitive topics like suicide or self-harm.
+- If the user mentions suicide, self-harm, or crisis, respond with empathy and direct them to professional help (e.g., 'I'm here for you. Please contact a helpline like 988 in the US or a local crisis service.').
+- If the user asks for examples (e.g., how to validate feelings or avoid harmful advice), provide concise examples such as: 
+  - To validate feelings: 'It sounds like you're going through a tough time, and that’s okay to feel that way.'
+  - To avoid harmful advice: Instead of suggesting actions, say 'I’m here to listen and support you.'
+- Keep responses concise, positive, and focused on support. Avoid formal sign-offs like 'Best regards' or including a name. Ensure responses are complete and do not cut off mid-sentence, especially when providing lists.
+<|im_end|>
+<|im_start|>user
+{context}
+{question}
+<|im_end|>
+<|im_start|>assistant
 """
 
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"} 
+    model_kwargs={"device": "cpu"}
 )
 
 try:
     db = FAISS.load_local(DB_FAISS_PATH, embedding_model, allow_dangerous_deserialization=True)
+    print("FAISS database loaded successfully.")
 except Exception as e:
     print(f"Error loading FAISS database: {e}")
-    db = None  
+    db = None
 
-print(f"Loading {MODEL_NAME} model locally...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.float32, 
-    device_map="cpu",
-)
-
-text_generator = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=100, 
-    temperature=0.5,
-    do_sample=True, 
-    device_map="auto", 
-)
-
+# Local LLM wrapper
 class LocalLLM(LLM):
-    pipeline: Pipeline
-    stop: Optional[List[str]] = None
-    callbacks: Optional[List] = None
+    model: AutoModelForCausalLM
+    tokenizer: AutoTokenizer
+    max_new_tokens: int = 150
+    temperature: float = 0.5
+    do_sample: bool = True
+    device: str = "cpu"
+    eos_token_id: Optional[int] = None
 
-    def __init__(self, pipeline: Pipeline, stop: Optional[List[str]] = None, callbacks: Optional[List] = None):
-        object.__setattr__(self, "pipeline", pipeline)
-        object.__setattr__(self, "stop", stop)
-        object.__setattr__(self, "callbacks", callbacks)
+    def __init__(self, model_name, max_new_tokens=150, temperature=0.5, do_sample=True, device="cpu"):
+        object.__setattr__(self, "tokenizer", AutoTokenizer.from_pretrained(model_name))
+        object.__setattr__(self, "model", AutoModelForCausalLM.from_pretrained(model_name).to(device))
+        object.__setattr__(self, "max_new_tokens", max_new_tokens)
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "do_sample", do_sample)
+        object.__setattr__(self, "device", device)
+        if "<|im_end|>" in self.tokenizer.special_tokens_map:
+            object.__setattr__(self, "eos_token_id", self.tokenizer.encode("<|im_end|>")[0])
+        else:
+            object.__setattr__(self, "eos_token_id", None)
 
-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        outputs = self.pipeline(prompt)
-        return outputs[0]["generated_text"][len(prompt):].strip()
+    def _call(self, prompt: str) -> str:
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        generate_ids = self.model.generate(
+            inputs.input_ids,
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+            do_sample=self.do_sample,
+            eos_token_id=self.eos_token_id
+        )
+        input_len = inputs.input_ids.shape[1]
+        generated_ids = generate_ids[0, input_len:]
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        
+        generated_text = self._ensure_complete_sentences(generated_text)
+        return generated_text.strip()
+
+    def _ensure_complete_sentences(self, text: str) -> str:
+        sentences = text.split('. ')
+        seen = set()
+        unique_sentences = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence and sentence not in seen:
+                seen.add(sentence)
+                unique_sentences.append(sentence)
+        
+        result = '. '.join(unique_sentences)
+        if unique_sentences and not unique_sentences[-1].endswith('.'):
+            if any(unique_sentences[-1].startswith(str(i)) for i in range(1, 10)):
+                return result
+        return result + ('.' if unique_sentences and result else '')
 
     @property
     def _llm_type(self) -> str:
         return "local-hf"
 
-    def generate(self, prompt_strings: List[str], stop: Optional[List[str]] = None, callbacks: Optional[CallbackManager] = None, **kwargs) -> LLMResult:
-        if callbacks:
-            if isinstance(callbacks, CallbackManager):
-                for callback in callbacks.handlers:
-                    if hasattr(callback, "on_generate"):
-                        callback.on_generate(prompt_strings)
-            else:
-                for callback in callbacks:
-                    if hasattr(callback, "on_generate"):
-                        callback.on_generate(prompt_strings)
-
+    def generate(self, prompt_strings: List[str], stop: Optional[List[str]] = None, **kwargs) -> LLMResult:
         generations = []
         for prompt in prompt_strings:
-            text = self._call(prompt, stop)
+            text = self._call(prompt)
             generations.append([Generation(text=text)])
-
         return LLMResult(generations=generations)
 
-local_llm = LocalLLM(text_generator)
-prompt = PromptTemplate(template=CUSTOM_PROMPT_TEMPLATE, input_variables=["context", "question"])
+local_llm = LocalLLM(model_name=MODEL_NAME, device="cpu")
+prompt = PromptTemplate(
+    template=CUSTOM_PROMPT_TEMPLATE,
+    input_variables=["context", "question"]
+)
 
 qa_chain = RetrievalQA.from_chain_type(
     llm=local_llm,
     chain_type="stuff",
-    retriever=db.as_retriever(search_kwargs={"k": 1}) if db else None,  
+    retriever=db.as_retriever(search_kwargs={"k": 1}) if db else None,
     return_source_documents=True,
     chain_type_kwargs={"prompt": prompt}
 )
@@ -116,20 +140,27 @@ qa_chain = RetrievalQA.from_chain_type(
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.json
-    query = data.get("query", "")
+    query = data.get("query", "").lower()
     if not query:
         return jsonify({"error": "Query not provided"}), 400
+
+    crisis_keywords = ["suicide", "self-harm", "kill myself", "end my life"]
+    if any(keyword in query for keyword in crisis_keywords):
+        safe_response = (
+            "I'm so sorry you're feeling this way. I'm here for you. Please contact a helpline like 1166. "
+            "or a local crisis service for immediate support. You are not alone."
+        )
+        return jsonify({"answer": safe_response, "sources": []})
 
     try:
         result = qa_chain.invoke({"query": query})
         answer = result["result"]
         sources = [doc.page_content for doc in result["source_documents"]]
+        return jsonify({"answer": answer, "sources": sources})
     except Exception as e:
         print(f"Error during QA chain invocation: {e}")
-        answer = "I'm sorry, I don't know the answer."
-        sources = []
-
-    return jsonify({"answer": answer, "sources": sources})
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=False, threaded=True)
+    print("Starting Flask server...")
+    app.run(debug=False)
