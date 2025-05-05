@@ -17,7 +17,6 @@ print("Device:", "GPU" if torch.cuda.is_available() else "CPU")
 app = Flask(__name__)
 CORS(app)
 
-# Paths and model name
 DB_FAISS_PATH = "faiss_database"
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
@@ -26,10 +25,11 @@ CUSTOM_PROMPT_TEMPLATE = """
 You are a helpful and supportive mental health assistant. Your primary goal is to provide empathetic, non-judgmental, and safe support. Always:
 - If the user greets you with 'hi', 'hello', or similar phrases, respond exactly with 'Hi, how are you feeling today?' and nothing else.
 - Avoid giving advice that could be harmful or misinterpreted, especially on sensitive topics like suicide or self-harm.
+- If the user mentions suicide, self-harm, or crisis, respond with empathy and direct them to professional help (e.g., 'I'm here for you. Please contact a helpline like 1166 or a local crisis service.').
 - If the user asks for examples (e.g., how to validate feelings or avoid harmful advice), provide concise examples such as: 
   - To validate feelings: 'It sounds like you're going through a tough time, and that’s okay to feel that way.'
   - To avoid harmful advice: Instead of suggesting actions, say 'I’m here to listen and support you.'
-- Keep responses concise, positive, and focused on support. Avoid formal sign-offs like 'Best regards' or including a name. Ensure responses are complete and do not cut off mid-sentence, especially when providing lists.
+- Keep responses concise, positive, and focused on support. Avoid formal sign-offs or including a name. Ensure responses are complete and do not cut off mid-sentence, especially when providing lists.
 <|im_end|>
 <|im_start|>user
 {context}
@@ -50,17 +50,16 @@ except Exception as e:
     print(f"Error loading FAISS database: {e}")
     db = None
 
-# Local LLM wrapper
 class LocalLLM(LLM):
     model: AutoModelForCausalLM
     tokenizer: AutoTokenizer
-    max_new_tokens: int = 150
+    max_new_tokens: int = 200
     temperature: float = 0.5
     do_sample: bool = True
     device: str = "cpu"
     eos_token_id: Optional[int] = None
 
-    def __init__(self, model_name, max_new_tokens=150, temperature=0.5, do_sample=True, device="cpu"):
+    def __init__(self, model_name, max_new_tokens=200, temperature=0.5, do_sample=True, device="cpu"):
         object.__setattr__(self, "tokenizer", AutoTokenizer.from_pretrained(model_name))
         object.__setattr__(self, "model", AutoModelForCausalLM.from_pretrained(model_name).to(device))
         object.__setattr__(self, "max_new_tokens", max_new_tokens)
@@ -85,6 +84,11 @@ class LocalLLM(LLM):
         generated_ids = generate_ids[0, input_len:]
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
+        truncate_markers = ["<|assistant|>", "<|user|>"]
+        truncate_pos = min((generated_text.find(marker) for marker in truncate_markers if generated_text.find(marker) != -1), default=len(generated_text))
+        if truncate_pos != len(generated_text):
+            generated_text = generated_text[:truncate_pos].strip()
+        
         generated_text = self._ensure_complete_sentences(generated_text)
         return generated_text.strip()
 
@@ -102,7 +106,7 @@ class LocalLLM(LLM):
         result = '. '.join(unique_sentences)
         if unique_sentences and not unique_sentences[-1].endswith('.'):
             if any(unique_sentences[-1].startswith(str(i)) for i in range(1, 10)):
-                return result
+                return result 
         return result + ('.' if unique_sentences and result else '')
 
     @property
